@@ -18,6 +18,8 @@ from kivy.core.window import Window # For Hover Effects
 
 # Importing login screen from the separate file
 from login_screen import LoginScreen
+from user_dashboard import UserDashboard
+from admin_dashboard import AdminDashboard
 
 ASSETS_DIR = Path(__file__).resolve().parent / 'Assets'
 
@@ -67,7 +69,7 @@ class StartUpScreen(Screen):
             size = lambda instance, value: setattr(self.rect, 'size', value),
             pos = lambda instance, value: setattr(self.rect, 'pos', value),
         )
-
+    
         # [3] Version Type
         version_Label = Label (
             text = 'v1.0.0-beta',
@@ -359,6 +361,8 @@ class BarangayApp(App):
         sm = ScreenManager()
         sm.add_widget(StartUpScreen(name = 'StartUp'))
         sm.add_widget(LoginScreen(name = 'login'))
+        sm.add_widget(UserDashboard(name = 'resident_dashboard'))
+        sm.add_widget(AdminDashboard(name = 'admin_dashboard'))
         return sm
 
 if __name__ == '__main__':
