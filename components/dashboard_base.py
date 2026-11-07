@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import os
+import sys
 
 from kivy.app import App
 from kivy.graphics import Color, Rectangle, RoundedRectangle
@@ -32,6 +33,9 @@ def database_path():
     configured = os.getenv("BMS_DATA_DIR")
     if configured:
         return Path(configured) / "barangay.db"
+    if getattr(sys, "frozen", False):
+        app_data = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "BarangayEConnect"
+        return app_data / "barangay.db"
     app = App.get_running_app()
     if app and platform in ("android", "ios"):
         return Path(app.user_data_dir) / "barangay.db"
@@ -74,8 +78,16 @@ class DashboardBase(Screen):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self.session_user = {}
         self._menu_records = []
         self._build_shell()
+
+    def set_session_user(self, user):
+        """Attach the verified local account used to open this dashboard."""
+        self.session_user = dict(user or {})
+        if hasattr(self, "session_label"):
+            username = self.session_user.get("username") or self.session_user.get("full_name") or "account"
+            self.session_label.text = f"SIGNED IN\n{username}"
 
     def _build_shell(self):
         root = BoxLayout(orientation="horizontal")
@@ -90,8 +102,11 @@ class DashboardBase(Screen):
         self.sidebar.add_widget(self.brand)
         self.role_label = Label(text=self.role.upper(), color=(0.70, 0.78, 0.88, 1), size_hint_y=None, height=dp(27), font_size="11sp", halign="left")
         self.sidebar.add_widget(self.role_label)
+        self.session_label = Label(text="NOT SIGNED IN", color=(0.73, 0.84, 0.96, 1), size_hint_y=None, height=dp(38), font_size="10sp", halign="left", valign="middle")
+        self.session_label.bind(size=lambda w, s: setattr(w, "text_size", s))
+        self.sidebar.add_widget(self.session_label)
         for label, icon, callback in self.menu_items():
-            button = DashboardButton(text=f"{icon}   {label}", size_hint_y=None, height=dp(45), halign="left", valign="middle", padding_x=dp(12), fill=(0.11, 0.27, 0.46, 1), color=WHITE, font_name="Roboto", font_size="14sp", shorten=True, shorten_from="right")
+            button = DashboardButton(text=f"{icon}   {label}", size_hint_y=None, height=dp(45), halign="left", valign="middle", padding=(dp(12), 0), fill=(0.11, 0.27, 0.46, 1), color=WHITE, font_name="Roboto", font_size="14sp", shorten=True, shorten_from="right")
             button.bind(size=lambda w, s: setattr(w, "text_size", (s[0] - dp(22), s[1])))
             button.bind(on_release=lambda instance, fn=callback: self._dispatch_menu(instance, fn))
             self.sidebar.add_widget(button)
@@ -151,6 +166,7 @@ class DashboardBase(Screen):
         self.brand.text = "BE" if compact else "BARANGAY\nE-CONNECT"
         self.brand.font_size = "18sp" if compact else "20sp"
         self.role_label.height = 0 if compact else dp(27)
+        self.session_label.height = 0 if compact else dp(38)
         for button, label, icon in self._menu_records:
             button.text = icon if compact else f"{icon}   {label}"
             button.halign = "center" if compact else "left"
@@ -168,6 +184,7 @@ class DashboardBase(Screen):
             "Document requests": "Requests",
             "Hotlines and contacts": "Hotlines",
             "Report hub": "Reports",
+            "Profile and settings": "Profile",
         }.get(title, title)
         for button, label, _icon in self._menu_records:
             button._fill = BLUE if label == menu_title else (0.11, 0.27, 0.46, 1)
@@ -198,12 +215,49 @@ class DashboardBase(Screen):
         widget.bind(size=lambda w, s: setattr(w, "text_size", s))
         return widget
 
+    def show_profile(self, *_):
+        account_id = self.session_user.get("id")
+        account = self.store.get_account(account_id) if account_id else None
+        if not account:
+            self.open_message("Profile unavailable", "Your signed-in account could not be found in the local database.")
+            return
+        self.set_page("Profile and settings", "Update the profile information you provided during account creation.")
+        self.content.add_widget(self.label(f"Signed in as {account.get('username') or account.get('full_name', '')} ({account.get('role', 'resident')})", color=BLUE, size=dp(34), bold=True, font_size="13sp"))
+        self.profile_inputs = {}
+        fields = (
+            ("full_name", "Full name"), ("email", "Email address"), ("contact_number", "Contact number"),
+            ("birth_date", "Date of birth (YYYY-MM-DD)"), ("sex", "Sex"), ("civil_status", "Civil status"),
+            ("house_number", "House / block number"), ("street", "Street / sitio"), ("barangay", "Barangay"),
+            ("city", "City / municipality"), ("province", "Province"),
+        )
+        for key, hint in fields:
+            self.profile_inputs[key] = self.field(hint, dp(46), str(account.get(key) or ""))
+        self.content.add_widget(self.label("Verified ID and account role are protected from profile edits. Contact barangay staff if those details need correction.", color=MUTED, size=dp(48), font_size="11sp"))
+        self.action("Save profile changes", self.save_profile, GREEN)
+
+    def save_profile(self, *_):
+        account_id = self.session_user.get("id")
+        if not account_id or not getattr(self, "profile_inputs", None):
+            return
+        values = {key: widget.text for key, widget in self.profile_inputs.items()}
+        values["address"] = ", ".join(values[key].strip() for key in ("house_number", "street", "barangay", "city", "province"))
+        try:
+            self.store.update_account_profile(account_id, **values)
+            self.session_user.update(values)
+            self.session_user["full_name"] = values["full_name"].strip()
+            if hasattr(self, "resident_name"):
+                self.resident_name = values["full_name"].strip()
+        except ValueError as error:
+            self.open_message("Profile not updated", str(error))
+            return
+        self.open_message("Profile updated", "Your profile information has been saved to the database.")
+
     def open_message(self, title, message):
         content = BoxLayout(orientation="vertical", padding=dp(16), spacing=dp(12))
         text = Label(text=message, color=INK, halign="left", valign="middle")
         text.bind(size=lambda w, s: setattr(w, "text_size", s))
         content.add_widget(text)
-        popup = Popup(title=title, content=content, size_hint=(0.85, None), height=dp(230), auto_dismiss=True)
+        popup = Popup(title=title, content=content, size_hint=(0.85, None), height=dp(230), auto_dismiss=True, background="", background_color=(1, 1, 1, 1), separator_height=0, title_color=INK)
         close = DashboardButton(text="Close", size_hint_y=None, height=dp(40), fill=NAVY, color=WHITE)
         close.bind(on_release=popup.dismiss)
         content.add_widget(close)
@@ -216,7 +270,7 @@ class DashboardBase(Screen):
         body.bind(size=lambda w, s: setattr(w, "text_size", s))
         content.add_widget(body)
         buttons = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(10))
-        popup = Popup(title=title, content=content, size_hint=(0.88, None), height=dp(220))
+        popup = Popup(title=title, content=content, size_hint=(0.88, None), height=dp(220), background="", background_color=(1, 1, 1, 1), separator_height=0, title_color=INK)
         cancel = DashboardButton(text="Cancel", fill=(0.45, 0.50, 0.57, 1), color=WHITE)
         cancel.bind(on_release=popup.dismiss)
         remove = DashboardButton(text="Confirm", fill=RED, color=WHITE)
@@ -226,13 +280,28 @@ class DashboardBase(Screen):
         content.add_widget(buttons)
         popup.open()
 
+    def _clear_session(self):
+        self.session_user = {}
+        if hasattr(self, "resident_name"):
+            self.resident_name = ""
+        if hasattr(self, "session_label"):
+            self.session_label.text = "NOT SIGNED IN"
+
     def sign_out(self, *_):
+        self.confirm("Confirm sign out", "Are you sure you want to sign out and return to the login page?", self._complete_sign_out)
+
+    def _complete_sign_out(self):
+        self._clear_session()
         if self.manager and "login" in self.manager.screen_names:
             self.manager.current = "login"
         elif App.get_running_app():
             App.get_running_app().stop()
 
     def logout(self, *_):
+        self.confirm("Confirm logout", "Are you sure you want to logout and return to the welcome page?", self._complete_logout)
+
+    def _complete_logout(self):
+        self._clear_session()
         if self.manager and "StartUp" in self.manager.screen_names:
             self.manager.current = "StartUp"
         elif App.get_running_app():

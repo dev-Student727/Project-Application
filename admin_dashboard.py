@@ -33,6 +33,7 @@ class AdminDashboard(DashboardBase):
             ("Requests", chr(0x25A4), self.show_requests),
             ("Hotlines", chr(0x260E), self.show_hotlines),
             ("Reports", chr(0x25A7), self.show_reports),
+            ("Profile", chr(0x2699), self.show_profile),
         )
 
     def __init__(self, **kwargs):
@@ -40,6 +41,11 @@ class AdminDashboard(DashboardBase):
         self.notifications = NotificationService(self.store)
         super().__init__(**kwargs)
         self.show_announcements()
+
+    def on_enter(self, *_):
+        # Refresh shared request data whenever staff opens the dashboard so
+        # requests created by residents are visible immediately.
+        self.show_requests()
 
     def _record_card(self, title, subtitle, body=""):
         card = self.card(padding=dp(12), spacing=dp(4))

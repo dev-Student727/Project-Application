@@ -7,6 +7,10 @@ from contextlib import contextmanager
 from pathlib import Path
 import sqlite3
 import uuid
+import hashlib
+import secrets
+import os
+import sys
 
 
 DEFAULT_CAPACITY = 20
@@ -25,7 +29,15 @@ class BarangayStore:
     """Database access and domain operations, kept separate from Kivy widgets."""
 
     def __init__(self, db_path=None):
-        self.db_path = Path(db_path) if db_path else Path(__file__).resolve().parent / "barangay.db"
+        if db_path:
+            self.db_path = Path(db_path)
+        elif os.environ.get("BMS_DATA_DIR"):
+            self.db_path = Path(os.environ["BMS_DATA_DIR"]) / "barangay.db"
+        elif getattr(sys, "frozen", False):
+            app_data = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "BarangayEConnect"
+            self.db_path = app_data / "barangay.db"
+        else:
+            self.db_path = Path(__file__).resolve().parent / "barangay.db"
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.initialize()
 
@@ -60,6 +72,7 @@ class BarangayStore:
                 );
                 CREATE TABLE IF NOT EXISTS document_requests (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER,
                     request_no TEXT NOT NULL UNIQUE,
                     resident_name TEXT NOT NULL,
                     email TEXT,
@@ -85,6 +98,7 @@ class BarangayStore:
                 );
                 CREATE TABLE IF NOT EXISTS reports (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER,
                     reference_no TEXT NOT NULL UNIQUE,
                     resident_name TEXT NOT NULL,
                     email TEXT,
@@ -128,16 +142,181 @@ class BarangayStore:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS user_accounts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT UNIQUE,
+                    full_name TEXT NOT NULL,
+                    email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    contact_number TEXT NOT NULL,
+                    address TEXT NOT NULL,
+                    birth_date TEXT DEFAULT '',
+                    sex TEXT DEFAULT '',
+                    civil_status TEXT DEFAULT '',
+                    house_number TEXT DEFAULT '',
+                    street TEXT DEFAULT '',
+                    barangay TEXT DEFAULT '',
+                    city TEXT DEFAULT '',
+                    province TEXT DEFAULT '',
+                    role TEXT NOT NULL DEFAULT 'resident',
+                    id_type TEXT NOT NULL,
+                    id_path TEXT NOT NULL,
+                    id_number TEXT DEFAULT '',
+                    id_full_name TEXT DEFAULT '',
+                    id_birth_date TEXT DEFAULT '',
+                    id_sex TEXT DEFAULT '',
+                    id_address TEXT DEFAULT '',
+                    id_issued_by TEXT DEFAULT '',
+                    id_expiry TEXT DEFAULT '',
+                    password_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    save_confirmed INTEGER NOT NULL DEFAULT 0,
+                    application_submitted INTEGER NOT NULL DEFAULT 0,
+                    application_verified INTEGER NOT NULL DEFAULT 0
+                );
                 CREATE INDEX IF NOT EXISTS idx_requests_date_status ON document_requests(request_date, status);
                 CREATE INDEX IF NOT EXISTS idx_reports_status_date ON reports(status, submitted_at);
                 CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(is_read, created_at);
             """)
+            account_columns = {row["name"] for row in db.execute("PRAGMA table_info(user_accounts)").fetchall()}
+            if "username" not in account_columns:
+                db.execute("ALTER TABLE user_accounts ADD COLUMN username TEXT")
+            for column in ("birth_date", "sex", "civil_status", "house_number", "street", "barangay", "city", "province", "id_number", "id_full_name", "id_birth_date", "id_sex", "id_address", "id_issued_by", "id_expiry"):
+                if column not in account_columns:
+                    db.execute(f"ALTER TABLE user_accounts ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
+            for column in ("save_confirmed", "application_submitted", "application_verified"):
+                if column not in account_columns:
+                    db.execute(f"ALTER TABLE user_accounts ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
+            for table in ("document_requests", "reports"):
+                columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
+                if "account_id" not in columns:
+                    db.execute(f"ALTER TABLE {table} ADD COLUMN account_id INTEGER")
+            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_user_accounts_username ON user_accounts(username)")
             seeded = db.execute("SELECT value FROM app_meta WHERE key='welcome_announcement_seeded'").fetchone()
             if not seeded:
                 if db.execute("SELECT COUNT(*) FROM announcements").fetchone()[0] == 0:
                     stamp = self.now()
                     db.execute("INSERT INTO announcements(title,content,category,published_at,is_published,created_at,updated_at) VALUES(?,?,?,?,?,?,?)", ("Welcome to Barangay E-Connect", "Official barangay announcements will appear here.", "General", stamp, 1, stamp, stamp))
                 db.execute("INSERT INTO app_meta(key,value) VALUES('welcome_announcement_seeded','1')")
+
+    def create_account(self, full_name, email, contact_number, address, role, id_type, id_path, password, username="", profile=None):
+        """Create a verified signup account with a salted password hash."""
+        values = [str(value).strip() for value in (full_name, email, contact_number, address, role, id_type, id_path, username)]
+        if not all(values) or not password:
+            raise ValueError("All account fields are required.")
+        profile = profile or {}
+        profile_values = {key: str(profile.get(key, "") or "").strip() for key in (
+            "birth_date", "sex", "civil_status", "house_number", "street", "barangay", "city", "province",
+            "id_number", "id_full_name", "id_birth_date", "id_sex", "id_address", "id_issued_by", "id_expiry",
+        )}
+        salt = secrets.token_hex(16)
+        password_hash = f"{salt}${hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 120000).hex()}"
+        try:
+            with self.connect() as db:
+                cursor = db.execute(
+                    """INSERT INTO user_accounts(
+                        full_name,email,contact_number,address,birth_date,sex,civil_status,
+                        house_number,street,barangay,city,province,role,id_type,id_path,
+                        id_number,id_full_name,id_birth_date,id_sex,id_address,id_issued_by,id_expiry,
+                        password_hash,created_at,username
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (values[0], values[1], values[2], values[3], profile_values["birth_date"], profile_values["sex"], profile_values["civil_status"],
+                     profile_values["house_number"], profile_values["street"], profile_values["barangay"], profile_values["city"], profile_values["province"],
+                     values[4], values[5], values[6], profile_values["id_number"], profile_values["id_full_name"], profile_values["id_birth_date"],
+                     profile_values["id_sex"], profile_values["id_address"], profile_values["id_issued_by"], profile_values["id_expiry"], password_hash, self.now(), values[7]),
+                )
+                return cursor.lastrowid
+        except sqlite3.IntegrityError as error:
+            if "username" in str(error).lower():
+                raise ValueError("That username/ID is already in use.") from error
+            raise ValueError("An account with that email already exists.") from error
+
+    def update_account_status(self, account_id, **status_fields):
+        allowed = {"save_confirmed", "application_submitted", "application_verified"}
+        updates = {key: int(bool(value)) for key, value in status_fields.items() if key in allowed}
+        if not updates:
+            return
+        assignments = ",".join(f"{key}=?" for key in updates)
+        with self.connect() as db:
+            cursor = db.execute(f"UPDATE user_accounts SET {assignments} WHERE id=?", (*updates.values(), account_id))
+            if cursor.rowcount == 0:
+                raise ValueError("Account was not found.")
+
+    def get_account(self, account_id):
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM user_accounts WHERE id=?", (account_id,)).fetchone()
+        return dict(row) if row else None
+
+    def has_accounts(self):
+        with self.connect() as db:
+            return db.execute("SELECT 1 FROM user_accounts LIMIT 1").fetchone() is not None
+
+    def latest_account(self):
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM user_accounts ORDER BY id DESC LIMIT 1").fetchone()
+        return dict(row) if row else None
+
+    def get_account_by_username(self, username):
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM user_accounts WHERE username=? COLLATE NOCASE", (str(username or "").strip(),)).fetchone()
+        return dict(row) if row else None
+
+    def authenticate_account(self, username, password):
+        account = self.get_account_by_username(username)
+        if not account or not account.get("application_verified"):
+            return None
+        stored_hash = str(account.get("password_hash") or "")
+        try:
+            salt, expected = stored_hash.split("$", 1)
+        except ValueError:
+            return None
+        actual = hashlib.pbkdf2_hmac("sha256", str(password or "").encode(), salt.encode(), 120000).hex()
+        if not secrets.compare_digest(actual, expected):
+            return None
+        return account
+
+    def update_account_password(self, account_id, password):
+        """Replace the stored password hash for an existing account."""
+        password = str(password or "")
+        if len(password) < 8 or not any(char.isupper() for char in password) or not any(char.islower() for char in password) or not any(char.isdigit() for char in password):
+            raise ValueError("Password must contain at least 8 characters, including upper/lowercase letters and a number.")
+        salt = secrets.token_hex(16)
+        password_hash = f"{salt}${hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 120000).hex()}"
+        with self.connect() as db:
+            cursor = db.execute("UPDATE user_accounts SET password_hash=? WHERE id=?", (password_hash, account_id))
+            if cursor.rowcount == 0:
+                raise ValueError("Account was not found.")
+
+    def update_account_profile(self, account_id, **profile):
+        allowed = {"full_name", "email", "contact_number", "address", "birth_date", "sex", "civil_status", "house_number", "street", "barangay", "city", "province"}
+        updates = {key: str(value or "").strip() for key, value in profile.items() if key in allowed}
+        if not updates or any(not value for value in updates.values()):
+            raise ValueError("Complete all profile fields before saving.")
+        if "email" in updates and "@" not in updates["email"]:
+            raise ValueError("Enter a valid email address.")
+        if "birth_date" in updates:
+            try:
+                date.fromisoformat(updates["birth_date"])
+            except ValueError as error:
+                raise ValueError("Birth date must use YYYY-MM-DD.") from error
+        if not updates.get("address"):
+            updates["address"] = ", ".join(updates.get(key, "") for key in ("house_number", "street", "barangay", "city", "province"))
+        assignments = ",".join(f"{key}=?" for key in updates)
+        try:
+            with self.connect() as db:
+                cursor = db.execute(f"UPDATE user_accounts SET {assignments} WHERE id=?", (*updates.values(), account_id))
+                if cursor.rowcount == 0:
+                    raise ValueError("Account was not found.")
+        except sqlite3.IntegrityError as error:
+            raise ValueError("That email address is already in use.") from error
+
+    def get_app_setting(self, key, default=None):
+        with self.connect() as db:
+            row = db.execute("SELECT value FROM app_meta WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+
+    def set_app_setting(self, key, value):
+        with self.connect() as db:
+            db.execute("INSERT INTO app_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
 
     @staticmethod
     def now():
@@ -186,7 +365,7 @@ class BarangayStore:
         with self.connect() as db:
             db.execute("DELETE FROM announcements WHERE id=?", (announcement_id,))
 
-    def create_request(self, resident_name, document_type, purpose, request_date=None, preferred_claim_date="", additional_info="", email="", bypass_capacity=False):
+    def create_request(self, resident_name, document_type, purpose, request_date=None, preferred_claim_date="", additional_info="", email="", bypass_capacity=False, account_id=None):
         resident_name, document_type, purpose = resident_name.strip(), document_type.strip(), purpose.strip()
         if not resident_name or not document_type or not purpose:
             raise ValueError("Resident name, document type, and purpose are required.")
@@ -217,13 +396,13 @@ class BarangayStore:
                     if next_count < next_capacity:
                         break
                 raise CapacityReachedError(f"Request window is full for {request_date}. Next available processing date: {next_key}.")
-            cursor = db.execute("INSERT INTO document_requests(request_no,resident_name,email,document_type,purpose,request_date,preferred_claim_date,additional_info,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (request_no,resident_name,email.strip(),document_type,purpose,request_date,preferred_claim_date,additional_info.strip(),"Received",stamp,stamp))
+            cursor = db.execute("INSERT INTO document_requests(account_id,request_no,resident_name,email,document_type,purpose,request_date,preferred_claim_date,additional_info,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (account_id,request_no,resident_name,email.strip(),document_type,purpose,request_date,preferred_claim_date,additional_info.strip(),"Received",stamp,stamp))
             request_id = cursor.lastrowid
             db.execute("INSERT INTO request_history(request_id,status,note,changed_at) VALUES(?,?,?,?)", (request_id,"Received","Request submitted",stamp))
             self._notify(db, resident_name, email, "Document request", f"Request {request_no} was received.", "request", request_id, f"request:{request_no}:Received")
             return request_no
 
-    def list_requests(self, search="", status=None, request_date=None):
+    def list_requests(self, search="", status=None, request_date=None, account_id=None):
         clauses, params = [], []
         if search.strip():
             query = f"%{search.strip()}%"
@@ -235,6 +414,9 @@ class BarangayStore:
         if request_date:
             clauses.append("request_date=?")
             params.append(request_date)
+        if account_id is not None:
+            clauses.append("account_id=?")
+            params.append(account_id)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         with self.connect() as db:
             return self._rows(db.execute(f"SELECT * FROM document_requests{where} ORDER BY created_at DESC", params))

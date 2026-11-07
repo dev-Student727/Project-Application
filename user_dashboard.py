@@ -23,6 +23,7 @@ class UserDashboard(DashboardBase):
             ("Requests", chr(0x25A4), self.show_documents),
             ("Report hub", chr(0x25A7), self.show_reports),
             ("Notifications", chr(0x25CF), self.show_notifications),
+            ("Profile", chr(0x2699), self.show_profile),
         )
 
     def __init__(self, **kwargs):
@@ -44,6 +45,12 @@ class UserDashboard(DashboardBase):
         if self._announcement_event is not None:
             self._announcement_event.cancel()
             self._announcement_event = None
+
+    def set_session_user(self, user):
+        super().set_session_user(user)
+        self.resident_name = self.session_user.get("full_name", "").strip()
+        if hasattr(self, "notification_badge"):
+            self._refresh_badge()
 
     def _poll_announcements(self, _dt):
         if self.page_title.text != "Announcements":
@@ -125,7 +132,10 @@ class UserDashboard(DashboardBase):
             submit.disabled = True
         self.content.add_widget(self.label("My requests", color=NAVY, size=dp(34), bold=True, font_size="15sp"))
         resident = self.resident_name.strip().casefold()
-        requests = [row for row in self.store.list_requests() if resident and row["resident_name"].casefold() == resident]
+        account_id = self.session_user.get("id")
+        requests = self.store.list_requests(account_id=account_id) if account_id else []
+        if not account_id:
+            requests = [row for row in self.store.list_requests() if resident and row["resident_name"].casefold() == resident]
         if not requests:
             self.content.add_widget(self.label("Enter your name above to view your requests.", color=MUTED, size=dp(34)))
         for request in requests:
@@ -150,6 +160,7 @@ class UserDashboard(DashboardBase):
                 preferred_claim_date=self.preferred_date_field.text.strip(),
                 additional_info=self.additional_field.text,
                 email=self.email_field.text,
+                account_id=self.session_user.get("id"),
             )
         except (ValueError, CapacityReachedError) as error:
             self.open_message("Request not submitted", str(error))
